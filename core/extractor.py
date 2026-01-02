@@ -11,18 +11,12 @@ def _norm(s: str) -> str:
 
 
 def extract_task(text: str) -> Task:
-    """
-    Rule-based extractor: raw text -> Task
-    No ML/LLM. Simple heuristics only.
-    """
     t = _norm(text)
 
-    # Guess input type (still text, but sometimes user explicitly mentions screenshots/photos)
     input_type = "text"
     if any(k in t for k in ["screenshot", "screen shot", "скрин", "скриншот", "photo", "фото", "image", "картинк"]):
         input_type = "image"
 
-    # Domain detection (very simple)
     domain = "general"
     if any(k in t for k in ["windows", "win11", "win 11", "win10", "pc", "laptop", "ноут", "компьютер"]):
         domain = "pc"
@@ -33,31 +27,47 @@ def extract_task(text: str) -> Task:
     if any(k in t for k in ["whatsapp", "telegram", "discord", "chrome", "steam", "spotify", "youtube"]):
         domain = "apps"
 
-    # Intent + output_type
+    # defaults
     intent = "understand"
-    output_type = "steps"
+    output_type = "summary"
 
-    if any(k in t for k in ["how to", "как", "help", "помогите", "fix", "починить", "исправить", "решить"]):
-        intent = "fix"
-        output_type = "steps"
-
-    if any(k in t for k in ["why", "почему", "что за", "что значит", "meaning", "ошибка", "error", "код"]):
+    # diagnose signals
+    if any(k in t for k in ["error", "ошибка", "код", "0x", "crash", "вылетает", "stuck", "failed", "не запускается"]):
         intent = "diagnose"
         output_type = "diagnosis"
 
+    # fix signals (complaint style)
+    if any(
+        k in t
+        for k in [
+            "not working", "doesn't work", "doesnt work", "не работает",
+            "keeps", "постоянно", "отваливается", "disconnect", "disconnecting", "drops", "падает",
+            "cant", "can't", "cannot", "не могу",
+        ]
+    ):
+        intent = "fix"
+        output_type = "steps"
+
+    # explicit help/how-to
+    if any(k in t for k in ["how to", "как", "fix", "починить", "исправить", "решить", "help", "помогите"]):
+        intent = "fix"
+        output_type = "steps"
+
+    # choose/recommend
     if any(k in t for k in ["best", "which", "choose", "выбрать", "что лучше", "какой лучше", "recommend"]):
         intent = "choose"
         output_type = "recommendation"
 
+    # recover
     if any(k in t for k in ["recover", "restore", "вернуть", "восстановить", "deleted", "удалил"]):
         intent = "recover"
         output_type = "steps"
 
+    # optimize
     if any(k in t for k in ["optimize", "ускорить", "lag", "лагает", "slow", "тормозит", "performance", "фпс"]):
         intent = "optimize"
         output_type = "steps"
 
-    # Improve problem_statement with a clean sentence
     problem_statement = text.strip()
     if len(problem_statement) > 220:
         problem_statement = problem_statement[:217] + "..."
