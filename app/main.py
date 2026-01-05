@@ -1,16 +1,18 @@
+# app/main.py
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from core.models import Task
 from core.extractor import extract_task
-from core.cluster import cluster_tasks
-from core.cluster import _norm_text as norm_text
-from core.idea_factory import ideas_from_clusters
+from core.cluster import norm_text
+from core.radar import build_radar
+from core.idea_builder import ideas_from_radar
+
 app = FastAPI(title="Hunter Agent")
 
 
@@ -19,6 +21,7 @@ class IngestRequest(BaseModel):
     source: Optional[str] = "manual"
     query: Optional[str] = None
     url: Optional[str] = None
+    tags: Optional[List[str]] = None
 
 
 class ExtractRequest(BaseModel):
@@ -33,6 +36,7 @@ class StoredRaw(BaseModel):
     source: Optional[str] = None
     query: Optional[str] = None
     url: Optional[str] = None
+    tags: Optional[List[str]] = None
     created_at: str
 
 
@@ -40,6 +44,7 @@ class StoredTask(BaseModel):
     id: int
     raw_id: int
     task: Task
+    meta: Dict[str, Any] = Field(default_factory=dict)
     created_at: str
 
 
@@ -71,6 +76,7 @@ def ingest(req: IngestRequest):
         source=req.source,
         query=req.query,
         url=req.url,
+        tags=req.tags,
         created_at=datetime.utcnow().isoformat() + "Z",
     )
     RAW_STORE.append(item)
@@ -102,6 +108,12 @@ def extract(req: ExtractRequest):
             id=len(TASK_STORE) + 1,
             raw_id=raw_item.id,
             task=task_obj,
+            meta={
+                "source": raw_item.source,
+                "query": raw_item.query,
+                "url": raw_item.url,
+                "tags": raw_item.tags or [],
+            },
             created_at=datetime.utcnow().isoformat() + "Z",
         )
         TASK_STORE.append(stored)
@@ -116,27 +128,70 @@ def extract(req: ExtractRequest):
         "items": created,
     }
 
-@app.get("/ideas")
-def ideas(limit: int = 10, min_count: int = 2):
-    all_tasks = [st.task for st in TASK_STORE]
-    clusters_list = cluster_tasks(all_tasks, sample_size=3)
-    clusters_list = [c for c in clusters_list if c["count"] >= min_count]
 
-    ideas_list = ideas_from_clusters(clusters_list, limit=limit)
-    return {"count": len(ideas_list), "items": [i.model_dump() for i in ideas_list]}
 @app.get("/tasks")
 def tasks(limit: int = 50):
     items = TASK_STORE[-limit:]
     return {"count": len(TASK_STORE), "items": [x.model_dump() for x in items]}
+@app.get("/radar")
+def radar(min_count: int = 2, limit: int = 30):
+    """
+    Radar строится не из Task'ов, а из расширенных строковых rows,
+    которые должны быть добавлены коллектором/ингестом в meta.
+    Сейчас используем эвристику: row = task + meta (если нет полей, будут 0).
+    """
+    rows: List[Dict[str, Any]] = []
+    for st in TASK_STORE:
+        m = st.meta or {}
+        rows.append(
+            {
+                "signature": m.get("signature") or f"{st.task.domain}|{st.task.intent}|{st.task.output_type}|misc|misc",
+                "text": st.task.problem_statement,
+                "tags": m.get("tags") or [],
+                "source": m.get("source") or "unknown",
+                "url": m.get("url") or None,
+                "created_at": 0,
+                "last_activity_at": int(m.get("last_activity_at") or 0),
+                "view_count": int(m.get("view_count") or 0),
+                "score": int(m.get("vote_score") or 0),
+                "answer_count": int(m.get("answer_count") or 0),
+                "is_answered": bool(m.get("is_answered") or False),
+                "label": m.get("label") or "unknown",
+            }
+        )
+
+    items = build_radar(rows=rows, min_count=min_count, limit=limit)
+    return {
+        "count": len(items),
+        "items": [
+            {
+                "signature": x.signature,
+                "count": x.count,
+                "score": round(x.score, 2),
+                "total_views": x.total_views,
+                "total_answers": x.total_answers,
+                "answered_ratio": round(x.answered_ratio, 3),
+                "avg_votes": round(x.avg_votes, 2),
+                "days_since_activity": round(x.age_days, 1),
+                "label": x.label,
+                "tags_top": x.tags_top,
+                "sources": x.sources,
+                "examples": x.examples,
+            }
+            for x in items
+        ],
+    }
 
 
-@app.get("/clusters")
-def clusters(limit: int = 20, min_count: int = 1, sample_size: int = 3):
-    # Build clusters from extracted tasks
-    all_tasks = [st.task for st in TASK_STORE]
-    clusters_list = cluster_tasks(all_tasks, sample_size=sample_size)
-    clusters_list = [c for c in clusters_list if c["count"] >= min_count]
-    return {"count": len(clusters_list), "items": clusters_list[:limit]}
+@app.get("/ideas")
+def ideas(min_count: int = 2, limit: int = 10):
+    """
+    Берём top radar items и превращаем их в идеи (без LLM).
+    """
+    r = radar(min_count=min_count, limit=max(limit, 30))
+    radar_items = r.get("items") or []
+    ideas_list = ideas_from_radar(radar_items, limit=limit)
+    return {"count": len(ideas_list), "items": [x.model_dump() for x in ideas_list]}
 
 
 @app.post("/reset")

@@ -2,99 +2,79 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from core.models import Task
 
-# --- Topic rules (без ML) ---
-_TOPIC_RULES: list[tuple[str, list[str]]] = [
-    ("meeting_notes_summary", [
-        r"\bmeeting(s)?\b",
-        r"\btranscript(s)?\b",
-        r"\bminutes\b",
-        r"\baction items?\b",
-        r"\bnotes?\b",
-        r"\bsummariz(e|ing|ation)\b",
-        r"\bscattered\b",
-        r"\bdocs?\b",
-        r"\bchats?\b",
-        r"\bworkflow\b",
-        r"\brewriting\b",
-        r"\bmanually\b",
-    ]),
-]
+_WS_RX = re.compile(r"\s+")
+_WORD_RX = re.compile(r"[a-z0-9]+|[а-я0-9]+", re.IGNORECASE)
 
-_COMPILED_RULES: list[tuple[str, list[re.Pattern[str]]]] = [
-    (name, [re.compile(p, re.IGNORECASE) for p in pats])
-    for name, pats in _TOPIC_RULES
-]
-
-_STOPWORDS = {
-    # EN
-    "a", "an", "the", "and", "or", "to", "for", "of", "on", "in", "at", "is", "are",
-    "with", "my", "your", "this", "that", "it", "does", "do", "not", "keeps", "keep",
-    "cant", "can't", "cannot", "won't", "wont", "why", "how", "what", "when",
-    # RU
-    "и", "или", "на", "в", "во", "к", "ко", "по", "из", "у", "с", "со", "это",
-    "не", "почему", "как", "что", "когда",
+_STOP = {
+    "how", "what", "why", "does", "do", "is", "are", "to", "in", "on", "for", "with",
+    "and", "or", "a", "the", "of", "my", "i", "can", "it", "this", "when", "then",
+    "using", "use", "used", "work", "works", "working", "problem", "issue", "error",
+    "help", "need", "question", "trying",
+    "windows", "android", "iphone", "ios",
 }
 
-
-def _norm_text(s: str) -> str:
+def norm_text(s: str) -> str:
     s = (s or "").strip().lower()
-    s = re.sub(r"\s+", " ", s)
+    s = _WS_RX.sub(" ", s)
     return s
 
-
-def classify_topic(text: str) -> str:
-    """
-    Стабильный topic для кластеров.
-    1) Сначала пытаемся попасть в rule bucket (например meeting_notes_summary)
-    2) Если не попали — fallback: первые 2-4 "значимых" слова
-    """
-    t = _norm_text(text)
-    if not t:
-        return "unknown"
-
-    best_name = None
-    best_hits = 0
-
-    for name, regs in _COMPILED_RULES:
-        hits = sum(1 for rx in regs if rx.search(t))
-        if hits > best_hits:
-            best_hits = hits
-            best_name = name
-
-    if best_name and best_hits >= 2:
-        return best_name
-
-    # fallback
-    words = re.findall(r"[a-z0-9]+|[а-я0-9]+", t, flags=re.IGNORECASE)
-    words = [w for w in words if w not in _STOPWORDS and len(w) >= 3]
+def _top_keyword(text: str) -> str:
+    t = norm_text(text)
+    words = [w.lower() for w in _WORD_RX.findall(t)]
+    words = [w for w in words if len(w) >= 4 and w not in _STOP]
     if not words:
         return "misc"
-
-    uniq = []
+    freq: Dict[str, int] = {}
     for w in words:
-        if w not in uniq:
-            uniq.append(w)
-        if len(uniq) >= 4:
-            break
-    return "_".join(uniq)
+        freq[w] = freq.get(w, 0) + 1
+    # 1 ключевое слово — чтобы topic не дробился
+    return sorted(freq.items(), key=lambda x: (-x[1], x[0]))[0][0]
 
+def _topic_from_tags(tags: Optional[List[str]], k: int = 2) -> str:
+    if not tags:
+        return ""
+    clean = [t.strip().lower() for t in tags if t and t.strip()]
+    clean = sorted(set(clean))
+    if not clean:
+        return ""
+    return "tags:" + "+".join(clean[:k])
 
-def cluster_tasks(tasks: List[Task], sample_size: int = 3) -> List[Dict]:
+def _topic_from_query(query: Optional[str]) -> str:
+    q = (query or "").strip().lower()
+    if not q:
+        return ""
+    # query у тебя типа "windows-11;wifi" — уже отличный coarse topic
+    return "q:" + q.replace(";", "+")
+
+def cluster_task_pairs(
+    pairs: List[Tuple[Task, Optional[List[str]], Optional[str], str]],
+    sample_size: int = 3,
+) -> List[Dict]:
     """
-    Groups tasks into clusters using key:
-      (domain, intent, output_type, topic)
-    where topic is rule-based classification from problem_statement.
+    pairs: (task, tags, query, raw_text)
+    topic приоритет:
+      1) tags (2 штуки)
+      2) query (tagged string)
+      3) fallback: 1 ключевое слово из текста
     """
     buckets: Dict[Tuple[str, str, str, str], Dict] = defaultdict(lambda: {"count": 0, "examples": []})
 
-    for task in tasks:
-        topic = classify_topic(task.problem_statement)
-        key = (task.domain, task.intent, task.output_type, topic)
+    for task, tags, query, raw_text in pairs:
+        domain = task.domain or "general"
+        intent = task.intent or "understand"
+        output_type = task.output_type or "summary"
 
+        topic = _topic_from_tags(tags)
+        if not topic:
+            topic = _topic_from_query(query)
+        if not topic:
+            topic = "kw:" + _top_keyword(raw_text or task.problem_statement)
+
+        key = (domain, intent, output_type, topic)
         b = buckets[key]
         b["count"] += 1
         if len(b["examples"]) < sample_size:
@@ -116,3 +96,4 @@ def cluster_tasks(tasks: List[Task], sample_size: int = 3) -> List[Dict]:
 
     clusters.sort(key=lambda c: c["count"], reverse=True)
     return clusters
+
