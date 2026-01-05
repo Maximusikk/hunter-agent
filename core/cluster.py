@@ -6,6 +6,28 @@ from typing import Dict, List, Tuple
 
 from core.models import Task
 
+# --- Topic rules (без ML) ---
+_TOPIC_RULES: list[tuple[str, list[str]]] = [
+    ("meeting_notes_summary", [
+        r"\bmeeting(s)?\b",
+        r"\btranscript(s)?\b",
+        r"\bminutes\b",
+        r"\baction items?\b",
+        r"\bnotes?\b",
+        r"\bsummariz(e|ing|ation)\b",
+        r"\bscattered\b",
+        r"\bdocs?\b",
+        r"\bchats?\b",
+        r"\bworkflow\b",
+        r"\brewriting\b",
+        r"\bmanually\b",
+    ]),
+]
+
+_COMPILED_RULES: list[tuple[str, list[re.Pattern[str]]]] = [
+    (name, [re.compile(p, re.IGNORECASE) for p in pats])
+    for name, pats in _TOPIC_RULES
+]
 
 _STOPWORDS = {
     # EN
@@ -14,44 +36,44 @@ _STOPWORDS = {
     "cant", "can't", "cannot", "won't", "wont", "why", "how", "what", "when",
     # RU
     "и", "или", "на", "в", "во", "к", "ко", "по", "из", "у", "с", "со", "это",
-    "не", "почему", "как", "что", "когда", "у меня", "мой", "моя", "мои",
+    "не", "почему", "как", "что", "когда",
 }
 
-_TOPIC_KEYWORDS: List[Tuple[str, List[str]]] = [
-    ("wifi_disconnect", ["wifi", "wi-fi", "disconnect", "disconnected", "drops", "drop", "падает", "отваливается"]),
-    ("bluetooth", ["bluetooth", "bt", "блютуз", "блютус"]),
-    ("battery_drain", ["battery", "drain", "overnight", "разряжается", "батарея"]),
-    ("storage_space", ["storage", "space", "disk", "ssd", "hdd", "место", "память", "диск"]),
-    ("performance_slow", ["slow", "lag", "stutter", "freeze", "тормозит", "лагает", "фризы", "подвисает"]),
-    ("update_failed", ["update", "updating", "failed", "error", "обнов", "ошибка", "код"]),
-    ("login_auth", ["login", "sign in", "auth", "password", "войти", "логин", "пароль"]),
-    ("audio_mic", ["mic", "microphone", "sound", "audio", "speaker", "микрофон", "звук", "аудио"]),
-    ("camera", ["camera", "webcam", "камера", "вебкам"]),
-    ("notifications", ["notification", "notify", "уведом", "push"]),
-    ("app_crash", ["crash", "stops", "close", "force close", "вылетает", "краш"]),
-]
 
-
-def norm_text(s: str) -> str:
-    s = s.strip().lower()
+def _norm_text(s: str) -> str:
+    s = (s or "").strip().lower()
     s = re.sub(r"\s+", " ", s)
     return s
 
 
-def guess_topic(text: str) -> str:
-    t = norm_text(text)
+def classify_topic(text: str) -> str:
+    """
+    Стабильный topic для кластеров.
+    1) Сначала пытаемся попасть в rule bucket (например meeting_notes_summary)
+    2) Если не попали — fallback: первые 2-4 "значимых" слова
+    """
+    t = _norm_text(text)
+    if not t:
+        return "unknown"
 
-    for topic, keys in _TOPIC_KEYWORDS:
-        if any(k in t for k in keys):
-            return topic
+    best_name = None
+    best_hits = 0
 
-    # fallback: take 2-4 "meaningful" words
+    for name, regs in _COMPILED_RULES:
+        hits = sum(1 for rx in regs if rx.search(t))
+        if hits > best_hits:
+            best_hits = hits
+            best_name = name
+
+    if best_name and best_hits >= 2:
+        return best_name
+
+    # fallback
     words = re.findall(r"[a-z0-9]+|[а-я0-9]+", t, flags=re.IGNORECASE)
     words = [w for w in words if w not in _STOPWORDS and len(w) >= 3]
     if not words:
-        return "unknown"
+        return "misc"
 
-    # take first few unique words
     uniq = []
     for w in words:
         if w not in uniq:
@@ -63,16 +85,14 @@ def guess_topic(text: str) -> str:
 
 def cluster_tasks(tasks: List[Task], sample_size: int = 3) -> List[Dict]:
     """
-    Groups tasks into clusters using a simple key:
+    Groups tasks into clusters using key:
       (domain, intent, output_type, topic)
-
-    Returns list of dict clusters:
-      { key, domain, intent, output_type, topic, count, examples }
+    where topic is rule-based classification from problem_statement.
     """
     buckets: Dict[Tuple[str, str, str, str], Dict] = defaultdict(lambda: {"count": 0, "examples": []})
 
     for task in tasks:
-        topic = guess_topic(task.problem_statement)
+        topic = classify_topic(task.problem_statement)
         key = (task.domain, task.intent, task.output_type, topic)
 
         b = buckets[key]

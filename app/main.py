@@ -8,8 +8,9 @@ from pydantic import BaseModel, Field
 
 from core.models import Task
 from core.extractor import extract_task
-from core.cluster import cluster_tasks, norm_text
-
+from core.cluster import cluster_tasks
+from core.cluster import _norm_text as norm_text
+from core.idea_factory import ideas_from_clusters
 app = FastAPI(title="Hunter Agent")
 
 
@@ -115,7 +116,14 @@ def extract(req: ExtractRequest):
         "items": created,
     }
 
+@app.get("/ideas")
+def ideas(limit: int = 10, min_count: int = 2):
+    all_tasks = [st.task for st in TASK_STORE]
+    clusters_list = cluster_tasks(all_tasks, sample_size=3)
+    clusters_list = [c for c in clusters_list if c["count"] >= min_count]
 
+    ideas_list = ideas_from_clusters(clusters_list, limit=limit)
+    return {"count": len(ideas_list), "items": [i.model_dump() for i in ideas_list]}
 @app.get("/tasks")
 def tasks(limit: int = 50):
     items = TASK_STORE[-limit:]
