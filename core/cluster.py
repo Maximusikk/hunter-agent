@@ -1,99 +1,81 @@
+# core/cluster.py
 from __future__ import annotations
 
 import re
-from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Iterable, Dict, Any, List
 
-from core.models import Task
+WS_RE = re.compile(r"\s+")
+NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 
-_WS_RX = re.compile(r"\s+")
-_WORD_RX = re.compile(r"[a-z0-9]+|[а-я0-9]+", re.IGNORECASE)
 
-_STOP = {
-    "how", "what", "why", "does", "do", "is", "are", "to", "in", "on", "for", "with",
-    "and", "or", "a", "the", "of", "my", "i", "can", "it", "this", "when", "then",
-    "using", "use", "used", "work", "works", "working", "problem", "issue", "error",
-    "help", "need", "question", "trying",
-    "windows", "android", "iphone", "ios",
-}
+def norm_text(text: str) -> str:
+    """
+    Нормализация для дедупа / грубого сравнения.
+    """
+    if not text:
+        return ""
+    t = text.strip().lower()
+    t = WS_RE.sub(" ", t)
+    return t
 
-def norm_text(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = _WS_RX.sub(" ", s)
-    return s
 
-def _top_keyword(text: str) -> str:
+def simple_topic_key(text: str) -> str:
+    """
+    Упрощённый ключ для кластеризации по "похожести" (очень грубо).
+    Нужен только как fallback, если нет нормальной сигнатуры.
+    """
     t = norm_text(text)
-    words = [w.lower() for w in _WORD_RX.findall(t)]
-    words = [w for w in words if len(w) >= 4 and w not in _STOP]
-    if not words:
-        return "misc"
-    freq: Dict[str, int] = {}
-    for w in words:
-        freq[w] = freq.get(w, 0) + 1
-    # 1 ключевое слово — чтобы topic не дробился
-    return sorted(freq.items(), key=lambda x: (-x[1], x[0]))[0][0]
+    t = NON_ALNUM_RE.sub(" ", t)
+    t = WS_RE.sub(" ", t).strip()
+    parts = t.split(" ")
+    # берём первые 6 токенов как грубый "топик"
+    return "_".join(parts[:6]) if parts else "misc"
 
-def _topic_from_tags(tags: Optional[List[str]], k: int = 2) -> str:
-    if not tags:
-        return ""
-    clean = [t.strip().lower() for t in tags if t and t.strip()]
-    clean = sorted(set(clean))
-    if not clean:
-        return ""
-    return "tags:" + "+".join(clean[:k])
 
-def _topic_from_query(query: Optional[str]) -> str:
-    q = (query or "").strip().lower()
-    if not q:
-        return ""
-    # query у тебя типа "windows-11;wifi" — уже отличный coarse topic
-    return "q:" + q.replace(";", "+")
-
-def cluster_task_pairs(
-    pairs: List[Tuple[Task, Optional[List[str]], Optional[str], str]],
-    sample_size: int = 3,
-) -> List[Dict]:
+def cluster_by_key(tasks: Iterable[Any], sample_size: int = 3) -> List[Dict[str, Any]]:
     """
-    pairs: (task, tags, query, raw_text)
-    topic приоритет:
-      1) tags (2 штуки)
-      2) query (tagged string)
-      3) fallback: 1 ключевое слово из текста
+    Fallback кластеризация, если тебе нужно быстро "что-то сгруппировать".
+    Ожидаем, что task имеет поля domain/intent/output_type/problem_statement.
     """
-    buckets: Dict[Tuple[str, str, str, str], Dict] = defaultdict(lambda: {"count": 0, "examples": []})
+    buckets: Dict[str, Dict[str, Any]] = {}
 
-    for task, tags, query, raw_text in pairs:
-        domain = task.domain or "general"
-        intent = task.intent or "understand"
-        output_type = task.output_type or "summary"
+    for t in tasks:
+        key = f"{t.domain}|{t.intent}|{t.output_type}|{simple_topic_key(t.problem_statement)}"
+        b = buckets.get(key)
+        if not b:
+            b = {
+                "key": key,
+                "domain": t.domain,
+                "intent": t.intent,
+                "output_type": t.output_type,
+                "topic": key.split("|", 3)[-1],
+                "count": 0,
+                "examples": [],
+            }
+            buckets[key] = b
 
-        topic = _topic_from_tags(tags)
-        if not topic:
-            topic = _topic_from_query(query)
-        if not topic:
-            topic = "kw:" + _top_keyword(raw_text or task.problem_statement)
-
-        key = (domain, intent, output_type, topic)
-        b = buckets[key]
         b["count"] += 1
         if len(b["examples"]) < sample_size:
-            b["examples"].append(task.problem_statement)
+            b["examples"].append(t.problem_statement)
 
-    clusters: List[Dict] = []
-    for (domain, intent, output_type, topic), data in buckets.items():
-        clusters.append(
-            {
-                "key": f"{domain}|{intent}|{output_type}|{topic}",
-                "domain": domain,
-                "intent": intent,
-                "output_type": output_type,
-                "topic": topic,
-                "count": data["count"],
-                "examples": data["examples"],
-            }
-        )
+    # сортировка по count desc
+    return sorted(buckets.values(), key=lambda x: x["count"], reverse=True)
 
-    clusters.sort(key=lambda c: c["count"], reverse=True)
-    return clusters
 
+import re
+
+WS_RE = re.compile(r"\s+")
+
+
+def norm_text(text: str) -> str:
+    """
+    Normalization for dedup / signatures:
+    - lowercase
+    - collapse whitespace
+    - strip
+    """
+    if not text:
+        return ""
+    t = text.strip().lower()
+    t = WS_RE.sub(" ", t)
+    return t

@@ -1,172 +1,213 @@
 # core/radar.py
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+from collections import Counter, defaultdict
 
 
 @dataclass
 class RadarItem:
     signature: str
     count: int
-    score: float
 
-    # aggregates
+    # aggregate metrics
+    score: float
     total_views: int
     total_answers: int
-    answered_ratio: float  # доля вопросов, где is_answered=True
+    answered_ratio: float
     avg_votes: float
-    last_activity_at: int
     age_days: float
 
-    # labels
+    # meta
     label: str
-    examples: List[str]
     tags_top: List[str]
     sources: List[str]
+    examples: List[str]
 
 
 def _now_ts() -> int:
     return int(datetime.now(tz=timezone.utc).timestamp())
 
 
-def _days_ago(ts: int, now_ts: int) -> float:
-    if ts <= 0:
+def _age_days_from_ts(ts: int) -> float:
+    if not ts or ts <= 0:
         return 9999.0
-    return max(0.0, (now_ts - ts) / 86400.0)
+    delta = _now_ts() - int(ts)
+    if delta < 0:
+        delta = 0
+    return delta / 86400.0
 
 
-def _freshness(days_since_activity: float, half_life_days: float = 14.0) -> float:
-    return math.exp(-days_since_activity / half_life_days)
+def _safe_int(x: Any, default: int = 0) -> int:
+    try:
+        if x is None:
+            return default
+        return int(x)
+    except Exception:
+        return default
 
 
-def _log1p(x: float) -> float:
-    return math.log1p(max(0.0, x))
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+def _pick_label(labels: Iterable[str]) -> str:
+    """
+    Берём самый частый label, но если есть что-то кроме 'unknown', предпочтём не-unknown.
+    """
+    c = Counter([l for l in labels if l])
+    if not c:
+        return "unknown"
+    if len(c) == 1:
+        return next(iter(c.keys()))
+    # prefer non-unknown if present
+    non_unknown = {k: v for k, v in c.items() if k != "unknown"}
+    if non_unknown:
+        return Counter(non_unknown).most_common(1)[0][0]
+    return c.most_common(1)[0][0]
+
+
+def _score_row(row: Dict[str, Any]) -> float:
+    """
+    Композитный скоринг "актуальность/массовость/полезность".
+
+    row ожидаемо содержит:
+      - view_count (int)
+      - score (votes) (int)  # да, поле часто называется score у тебя
+      - answer_count (int)
+      - is_answered (bool)
+      - days_since_activity (через last_activity_at)
+    """
+    views = _safe_int(row.get("view_count"), 0)
+    votes = _safe_int(row.get("score"), 0)
+    answers = _safe_int(row.get("answer_count"), 0)
+    is_answered = bool(row.get("is_answered") or False)
+
+    age_days = _age_days_from_ts(_safe_int(row.get("last_activity_at"), 0))
+    # затухание: свежие важнее
+    recency = 1.0 / (1.0 + age_days / 14.0)  # 14 дней "половинит" вклад
+
+    # просмотры: логарифм, чтобы 100k не ломали всё
+    views_term = (views + 1) ** 0.35  # мягче, чем log, но без math
+    votes_term = max(votes, 0) * 2.0 + (abs(min(votes, 0)) * -1.0)  # штраф за минуса
+    answers_term = min(answers, 10) * 1.5
+    answered_bonus = 3.0 if is_answered else 0.0
+
+    base = views_term + votes_term + answers_term + answered_bonus
+
+    # если нет метрик вообще — пусть будет маленький, но не ноль
+    if views == 0 and votes == 0 and answers == 0:
+        base = 1.0
+
+    return base * recency
 
 
 def build_radar(
-    rows: List[Dict],
+    items: List[Dict[str, Any]],
     min_count: int = 2,
     limit: int = 30,
-    now_ts: Optional[int] = None,
 ) -> List[RadarItem]:
     """
-    rows: список объектов вида:
-      {
-        "signature": str,
-        "text": str,
-        "tags": [...],
-        "source": "...",
-        "url": "...",
-        "created_at": int,
-        "last_activity_at": int,
-        "view_count": int,
-        "score": int,
-        "answer_count": int,
-        "is_answered": bool,
-        "label": str
-      }
+    items: список "тасков" (или строк), где у каждой есть как минимум:
+      - signature: str
+      - text: str (пример/проблема)
+      - tags: list[str]
+      - source: str
+      - last_activity_at: unix ts (int)  (может отсутствовать)
+      - view_count / score / answer_count / is_answered (могут отсутствовать)
+      - label (опционально)
+
+    Возвращает агрегированные RadarItem по signature.
     """
-    now = now_ts or _now_ts()
+    buckets: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
-    buckets: Dict[str, Dict] = {}
+    for row in items or []:
+        sig = (row.get("signature") or "").strip()
+        if not sig:
+            continue
+        buckets[sig].append(row)
 
-    for r in rows:
-        sig = r["signature"]
-        b = buckets.setdefault(
-            sig,
-            {
-                "count": 0,
-                "views": 0,
-                "answers": 0,
-                "votes_sum": 0,
-                "answered_cnt": 0,   # <- фикс
-                "last_activity": 0,
-                "examples": [],
-                "tags_freq": {},
-                "sources": set(),
-                "label_freq": {},
-            },
-        )
+    out: List[RadarItem] = []
 
-        b["count"] += 1
-        b["views"] += int(r.get("view_count") or 0)
-        b["answers"] += int(r.get("answer_count") or 0)
-        b["votes_sum"] += int(r.get("score") or 0)
-        b["answered_cnt"] += 1 if r.get("is_answered") else 0  # <- фикс
-        b["last_activity"] = max(b["last_activity"], int(r.get("last_activity_at") or 0))
-        b["sources"].add(str(r.get("source") or "unknown"))
-
-        lab = str(r.get("label") or "unknown")
-        b["label_freq"][lab] = b["label_freq"].get(lab, 0) + 1
-
-        for t in (r.get("tags") or []):
-            t = str(t).lower().strip()
-            if not t:
-                continue
-            b["tags_freq"][t] = b["tags_freq"].get(t, 0) + 1
-
-        txt = str(r.get("text") or "").strip()
-        if txt and len(b["examples"]) < 4:
-            b["examples"].append(txt)
-
-    radar: List[RadarItem] = []
-
-    for sig, b in buckets.items():
-        cnt = b["count"]
-        if cnt < min_count:
+    for sig, rows in buckets.items():
+        if len(rows) < int(min_count):
             continue
 
-        views = b["views"]
-        answers = b["answers"]
-        avg_votes = b["votes_sum"] / max(1, cnt)
-        last_act = b["last_activity"]
-        days_since = _days_ago(last_act, now)
-        fresh = _freshness(days_since)
+        # агрегаты
+        total_views = sum(_safe_int(r.get("view_count"), 0) for r in rows)
+        total_answers = sum(_safe_int(r.get("answer_count"), 0) for r in rows)
+        answered_cnt = sum(1 for r in rows if bool(r.get("is_answered") or False))
+        answered_ratio = answered_cnt / max(len(rows), 1)
 
-        # "дырка": много просмотров, мало ответов
-        unanswered_gap = 1.0 if (views >= 2000 and answers <= max(1, cnt // 3)) else 0.0
+        votes_list = [_safe_int(r.get("score"), 0) for r in rows]
+        avg_votes = sum(votes_list) / max(len(votes_list), 1)
 
-        mass_term = _log1p(cnt)
-        views_term = _log1p(views / 50.0)
-        fresh_term = fresh
-        gap_term = unanswered_gap
-        votes_term = max(0.0, _log1p(avg_votes + 1))
+        # age: берём "самую свежую активность" в кластере
+        last_ts = max(_safe_int(r.get("last_activity_at"), 0) for r in rows)
+        age_days = _age_days_from_ts(last_ts)
 
-        score = (
-            35.0 * mass_term +
-            40.0 * views_term +
-            18.0 * fresh_term +
-            12.0 * gap_term +
-            6.0 * votes_term
-        )
+        # label
+        label = _pick_label((str(r.get("label") or "unknown") for r in rows))
 
-        label = max(b["label_freq"].items(), key=lambda kv: kv[1])[0]
+        # tags + sources
+        tag_counter = Counter()
+        src_counter = Counter()
+        for r in rows:
+            src = (r.get("source") or "unknown").strip()
+            if src:
+                src_counter[src] += 1
+            tags = r.get("tags") or []
+            if isinstance(tags, list):
+                for t in tags:
+                    t = str(t).strip().lower()
+                    if t:
+                        tag_counter[t] += 1
 
-        tags_sorted = sorted(b["tags_freq"].items(), key=lambda kv: kv[1], reverse=True)
-        top_tags = [t for t, _ in tags_sorted[:5]]
+        tags_top = [t for t, _ in tag_counter.most_common(8)]
+        sources = [s for s, _ in src_counter.most_common(5)]
 
-        answered_ratio = b["answered_cnt"] / max(1, cnt)  # <- фикс
+        # score кластера: сумма композитных скорингов строк
+        cluster_score = sum(_score_row(r) for r in rows)
 
-        radar.append(
+        # примеры: топ по score_row
+        ranked_rows = sorted(rows, key=_score_row, reverse=True)
+        examples: List[str] = []
+        for r in ranked_rows[:5]:
+            txt = (r.get("text") or "").strip()
+            if txt:
+                # чуть режем, чтобы ответ не раздувался
+                if len(txt) > 2200:
+                    txt = txt[:2200] + "…"
+                examples.append(txt)
+
+        out.append(
             RadarItem(
                 signature=sig,
-                count=cnt,
-                score=score,
-                total_views=views,
-                total_answers=answers,
-                answered_ratio=answered_ratio,
-                avg_votes=avg_votes,
-                last_activity_at=last_act,
-                age_days=days_since,
+                count=len(rows),
+                score=float(cluster_score),
+                total_views=int(total_views),
+                total_answers=int(total_answers),
+                answered_ratio=float(answered_ratio),
+                avg_votes=float(avg_votes),
+                age_days=float(age_days),
                 label=label,
-                examples=b["examples"],
-                tags_top=top_tags,
-                sources=sorted(list(b["sources"])),
+                tags_top=tags_top,
+                sources=sources,
+                examples=examples,
             )
         )
 
-    radar.sort(key=lambda x: x.score, reverse=True)
-    return radar[:limit]
+    # сортировка: сначала score, потом count
+    out.sort(key=lambda x: (x.score, x.count), reverse=True)
+
+    if limit and limit > 0:
+        out = out[: int(limit)]
+
+    return out

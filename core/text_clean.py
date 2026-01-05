@@ -1,3 +1,4 @@
+# core/text_clean.py
 from __future__ import annotations
 
 import html
@@ -16,3 +17,8 @@ def clean_text(text: str) -> str:
     text = text.replace("'", " ").replace('"', " ")
     text = WS_RE.sub(" ", text).strip()
     return text
+
+
+# alias для старого имени, чтобы IDE не ругалась и старый код не падал
+def html_to_text(text: str) -> str:
+    return clean_text(text)

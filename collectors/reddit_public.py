@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Literal
+import time
 import requests
 
 
@@ -34,8 +35,38 @@ def fetch_reddit_subreddit_new(subreddit: str, limit: int = 25) -> List[Collecte
         selftext = d.get("selftext", "") or ""
         permalink = d.get("permalink", "") or ""
         link = "https://www.reddit.com" + permalink if permalink else ""
-        # сырье: заголовок + кусок тела (если есть)
         text = (title + "\n\n" + selftext).strip()
-        items.append(CollectedItem(source=f"reddit:r/{subreddit}", title=title, text=text, url=link, query=subreddit))
+
+        items.append(
+            CollectedItem(
+                source=f"reddit:r/{subreddit}",
+                title=title,
+                text=text,
+                url=link,
+                query=subreddit,
+            )
+        )
+
+    return items
+
+
+def fetch_posts(
+    subreddit: str,
+    limit: int = 25,
+    sort: Literal["new", "hot", "top"] = "new",
+    sleep_s: float = 0.0,
+) -> List[CollectedItem]:
+    """
+    Совместимость со старым кодом, который импортит fetch_posts().
+    Сейчас поддерживаем только sort="new" (публичный endpoint).
+    """
+    if sort != "new":
+        # без OAuth лучше не симулировать другие режимы — реддит часто режет.
+        sort = "new"
+
+    items = fetch_reddit_subreddit_new(subreddit=subreddit, limit=limit)
+
+    if sleep_s > 0:
+        time.sleep(sleep_s)
 
     return items

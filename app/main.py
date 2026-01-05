@@ -196,7 +196,8 @@ def radar(min_count: int = 2, limit: int = 30):
             }
         )
 
-    items = build_radar(rows=rows, min_count=min_count, limit=limit)
+    items = build_radar(items=rows, min_count=min_count, limit=limit)
+
     return {
         "count": len(items),
         "items": [

@@ -1,74 +1,36 @@
-# core/signature.py
 from __future__ import annotations
 
 import re
-from typing import List
+from core.models import Task
 
-STOPWORDS = {
-    "the", "a", "an", "is", "are", "to", "of", "and", "or",
-    "in", "on", "for", "with", "when", "while", "using",
-    "how", "what", "why", "does", "do", "can", "cannot",
-    "i", "my", "we", "our", "you",
+STOP = {
+    "i", "im", "i'm", "me", "my", "we", "you", "they", "it",
+    "a", "an", "the", "and", "or", "to", "of", "in", "on", "for", "with",
+    "this", "that", "these", "those",
+    "please", "help",
+    # мусор SE/тех. форумов
+    "using", "import", "code", "error", "issue", "problem",
 }
 
-KEYWORD_MAP = [
-    # domain / product
-    (r"\bfastapi\b", "fastapi"),
-    (r"\bwindows\b|\bwindows 10\b|\bwindows 11\b", "windows"),
-    (r"\biphone\b|\bios\b", "iphone"),
-    (r"\bandroid\b", "android"),
+TOKEN_RE = re.compile(r"[a-z0-9]+")
 
-    # problem types
-    (r"\b(upload|download|transfer)\b", "file_transfer"),
-    (r"\b(jwt|oauth|token|auth)\b", "auth"),
-    (r"\b(wifi|bluetooth|network)\b", "network"),
-    (r"\b(mock|pytest|test)\b", "testing"),
-    (r"\b(summary|summarize|notes|transcript)\b", "summarization"),
-    (r"\b(error|exception|traceback|fail)\b", "error"),
-]
+def _topic_bucket(text: str) -> str:
+    t = (text or "").lower()
 
+    if any(k in t for k in ("calories", "nutrition", "macro", "ingredients")):
+        return "calories_from_photo"
+    if any(k in t for k in ("outfit", "style", "hairstyle", "haircut", "how do i look")):
+        return "style_from_photo"
+    if any(k in t for k in ("plant", "mushroom", "insect", "bug", "snake", "spider")):
+        return "identify_living_thing"
+    if any(k in t for k in ("scam", "fake", "legit", "authentic", "real or fake")):
+        return "verify_authenticity"
+    if any(k in t for k in ("which one", "choose", "recommend", "better option")):
+        return "choose_between_options"
 
-def normalize_words(text: str) -> List[str]:
-    words = re.findall(r"[a-zA-Z]{3,}", text.lower())
-    return [w for w in words if w not in STOPWORDS]
+    return "misc_decision"
 
-
-def extract_topic(title: str, body: str) -> str:
-    text = f"{title} {body}".lower()
-
-    for pattern, label in KEYWORD_MAP:
-        if re.search(pattern, text):
-            return label
-
-    words = normalize_words(text)
-    return words[0] if words else "misc"
-
-
-def extract_domain(tags: List[str]) -> str:
-    if not tags:
-        return "general"
-
-    if "fastapi" in tags or "python" in tags:
-        return "dev"
-
-    if "windows" in tags:
-        return "pc"
-
-    if "iphone" in tags or "ios" in tags:
-        return "mobile"
-
-    return "general"
-
-
-def make_signature(*, title: str, body: str, tags: List[str]) -> str:
-    """
-    Stable clustering key:
-    domain | intent | output | topic
-    """
-
-    domain = extract_domain(tags)
-    intent = "understand"
-    output = "summary"
-    topic = extract_topic(title, body)
-
-    return f"{domain}|{intent}|{output}|{topic}"
+def make_signature(task: Task) -> str:
+    topic = _topic_bucket(task.problem_statement)
+    # Кластер строим по “структуре задачи”, а не по текстовому шуму
+    return f"{task.domain}|{task.intent}|{task.output_type}|{topic}"
