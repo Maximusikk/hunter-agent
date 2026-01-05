@@ -2,62 +2,73 @@
 from __future__ import annotations
 
 import re
-from typing import List, Optional
+from typing import List
 
-from core.subtopics import pick_subtopic
-
-_STOP = {
-    "how", "what", "why", "does", "do", "is", "are", "to", "in", "on", "for", "with",
-    "and", "or", "a", "the", "of", "my", "i", "can", "it", "this", "when", "then",
-    "error", "issue", "problem", "help",
-    "using", "use", "used", "trying", "try", "want", "need",
-    "getting", "get", "gives", "give", "make", "made", "work", "working",
-    "doesnt", "doesn", "dont", "didnt", "cant", "cannot",
-    "python", "fastapi", "vscode", "pylance", "pytest", "asyncio",
+STOPWORDS = {
+    "the", "a", "an", "is", "are", "to", "of", "and", "or",
+    "in", "on", "for", "with", "when", "while", "using",
+    "how", "what", "why", "does", "do", "can", "cannot",
+    "i", "my", "we", "our", "you",
 }
 
-_WORD_RX = re.compile(r"[a-z0-9]+|[а-я0-9]+", re.IGNORECASE)
+KEYWORD_MAP = [
+    # domain / product
+    (r"\bfastapi\b", "fastapi"),
+    (r"\bwindows\b|\bwindows 10\b|\bwindows 11\b", "windows"),
+    (r"\biphone\b|\bios\b", "iphone"),
+    (r"\bandroid\b", "android"),
+
+    # problem types
+    (r"\b(upload|download|transfer)\b", "file_transfer"),
+    (r"\b(jwt|oauth|token|auth)\b", "auth"),
+    (r"\b(wifi|bluetooth|network)\b", "network"),
+    (r"\b(mock|pytest|test)\b", "testing"),
+    (r"\b(summary|summarize|notes|transcript)\b", "summarization"),
+    (r"\b(error|exception|traceback|fail)\b", "error"),
+]
 
 
-def keyword_hint(text: str, tags: Optional[List[str]] = None) -> str:
+def normalize_words(text: str) -> List[str]:
+    words = re.findall(r"[a-zA-Z]{3,}", text.lower())
+    return [w for w in words if w not in STOPWORDS]
+
+
+def extract_topic(title: str, body: str) -> str:
+    text = f"{title} {body}".lower()
+
+    for pattern, label in KEYWORD_MAP:
+        if re.search(pattern, text):
+            return label
+
+    words = normalize_words(text)
+    return words[0] if words else "misc"
+
+
+def extract_domain(tags: List[str]) -> str:
+    if not tags:
+        return "general"
+
+    if "fastapi" in tags or "python" in tags:
+        return "dev"
+
+    if "windows" in tags:
+        return "pc"
+
+    if "iphone" in tags or "ios" in tags:
+        return "mobile"
+
+    return "general"
+
+
+def make_signature(*, title: str, body: str, tags: List[str]) -> str:
     """
-    Самое частое содержательное слово в начале текста.
-    Если есть теги — добавляем их как доп. источник, чтобы не падать в "import".
+    Stable clustering key:
+    domain | intent | output | topic
     """
-    t = (text or "").lower()
-    words = [w.lower() for w in _WORD_RX.findall(t)]
-    words = [w for w in words if len(w) >= 5 and w not in _STOP]
 
-    # добавим теги как токены (они очень полезны в SE)
-    for tg in (tags or []):
-        tg = (tg or "").lower().replace("-", "")
-        if tg and tg not in _STOP and len(tg) >= 5:
-            words.append(tg)
+    domain = extract_domain(tags)
+    intent = "understand"
+    output = "summary"
+    topic = extract_topic(title, body)
 
-    head = words[:80]
-    if not head:
-        return "misc"
-
-    freq: dict[str, int] = {}
-    for w in head:
-        freq[w] = freq.get(w, 0) + 1
-
-    return max(freq.items(), key=lambda kv: kv[1])[0]
-
-
-def build_signature(
-    domain: str,
-    intent: str,
-    output_type: str,
-    problem_text: str,
-    tags: Optional[List[str]] = None,
-    query: Optional[str] = None,
-) -> str:
-    d = (domain or "general").lower()
-    i = (intent or "understand").lower()
-    o = (output_type or "summary").lower()
-
-    sub = pick_subtopic(problem_text, tags=tags, query=query)
-    kh = keyword_hint(problem_text, tags=tags)
-
-    return f"{d}|{i}|{o}|{sub}|{kh}"
+    return f"{domain}|{intent}|{output}|{topic}"

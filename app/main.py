@@ -18,10 +18,20 @@ app = FastAPI(title="Hunter Agent")
 
 class IngestRequest(BaseModel):
     text: str = Field(..., min_length=1)
+
+    # source info
     source: Optional[str] = "manual"
     query: Optional[str] = None
     url: Optional[str] = None
     tags: Optional[List[str]] = None
+
+    # metrics (optional, from collectors)
+    view_count: Optional[int] = 0
+    answer_count: Optional[int] = 0
+    is_answered: Optional[bool] = False
+    vote_score: Optional[int] = 0
+    last_activity_at: Optional[int] = 0  # unix ts
+    signature: Optional[str] = None       # domain|intent|output|subtopic|keyword
 
 
 class ExtractRequest(BaseModel):
@@ -33,10 +43,20 @@ class StoredRaw(BaseModel):
     id: int
     text: str
     normalized: str
+
     source: Optional[str] = None
     query: Optional[str] = None
     url: Optional[str] = None
-    tags: Optional[List[str]] = None
+    tags: List[str] = Field(default_factory=list)
+
+    # metrics
+    view_count: int = 0
+    answer_count: int = 0
+    is_answered: bool = False
+    vote_score: int = 0
+    last_activity_at: int = 0
+    signature: Optional[str] = None
+
     created_at: str
 
 
@@ -76,7 +96,13 @@ def ingest(req: IngestRequest):
         source=req.source,
         query=req.query,
         url=req.url,
-        tags=req.tags,
+        tags=req.tags or [],
+        view_count=int(req.view_count or 0),
+        answer_count=int(req.answer_count or 0),
+        is_answered=bool(req.is_answered or False),
+        vote_score=int(req.vote_score or 0),
+        last_activity_at=int(req.last_activity_at or 0),
+        signature=req.signature,
         created_at=datetime.utcnow().isoformat() + "Z",
     )
     RAW_STORE.append(item)
@@ -112,7 +138,13 @@ def extract(req: ExtractRequest):
                 "source": raw_item.source,
                 "query": raw_item.query,
                 "url": raw_item.url,
-                "tags": raw_item.tags or [],
+                "tags": raw_item.tags,
+                "view_count": raw_item.view_count,
+                "answer_count": raw_item.answer_count,
+                "is_answered": raw_item.is_answered,
+                "vote_score": raw_item.vote_score,
+                "last_activity_at": raw_item.last_activity_at,
+                "signature": raw_item.signature,
             },
             created_at=datetime.utcnow().isoformat() + "Z",
         )
@@ -133,19 +165,23 @@ def extract(req: ExtractRequest):
 def tasks(limit: int = 50):
     items = TASK_STORE[-limit:]
     return {"count": len(TASK_STORE), "items": [x.model_dump() for x in items]}
+
+
 @app.get("/radar")
 def radar(min_count: int = 2, limit: int = 30):
-    """
-    Radar строится не из Task'ов, а из расширенных строковых rows,
-    которые должны быть добавлены коллектором/ингестом в meta.
-    Сейчас используем эвристику: row = task + meta (если нет полей, будут 0).
-    """
     rows: List[Dict[str, Any]] = []
     for st in TASK_STORE:
         m = st.meta or {}
+        sig = m.get("signature")
+        if not sig:
+            # fallback: хотя бы domain|intent|output|tags|tags
+            t = st.task
+            tag_hint = "+".join(sorted(set((m.get("tags") or [])[:3]))) or "misc"
+            sig = f"{t.domain}|{t.intent}|{t.output_type}|tags:{tag_hint}|tags:{tag_hint}"
+
         rows.append(
             {
-                "signature": m.get("signature") or f"{st.task.domain}|{st.task.intent}|{st.task.output_type}|misc|misc",
+                "signature": sig,
                 "text": st.task.problem_statement,
                 "tags": m.get("tags") or [],
                 "source": m.get("source") or "unknown",
@@ -185,10 +221,7 @@ def radar(min_count: int = 2, limit: int = 30):
 
 @app.get("/ideas")
 def ideas(min_count: int = 2, limit: int = 10):
-    """
-    Берём top radar items и превращаем их в идеи (без LLM).
-    """
-    r = radar(min_count=min_count, limit=max(limit, 30))
+    r = radar(min_count=min_count, limit=max(limit, 50))
     radar_items = r.get("items") or []
     ideas_list = ideas_from_radar(radar_items, limit=limit)
     return {"count": len(ideas_list), "items": [x.model_dump() for x in ideas_list]}
