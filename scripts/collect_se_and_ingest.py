@@ -9,7 +9,7 @@ import requests
 from collectors.stackexchange import fetch_questions_with_body
 from core.signal_filter import is_signal_strict, is_signal_soft
 from core.text_clean import clean_text
-from core.signature import make_signature  # <-- должен существовать у тебя
+from core.signature import make_signature
 
 API_BASE = "http://127.0.0.1:8000"
 
@@ -49,6 +49,19 @@ def ingest(
     return not data.get("deduped", False)
 
 
+def _safe_int(obj, name: str, default: int = 0) -> int:
+    v = getattr(obj, name, default)
+    try:
+        return int(v or 0)
+    except Exception:
+        return default
+
+
+def _safe_bool(obj, name: str, default: bool = False) -> bool:
+    v = getattr(obj, name, default)
+    return bool(v) if v is not None else default
+
+
 def main() -> None:
     se_key = os.getenv("STACKEXCHANGE_KEY")
 
@@ -72,8 +85,11 @@ def main() -> None:
         for it in items:
             total += 1
 
-            body = clean_text(it.text)
-            title = clean_text(it.title)
+            body = clean_text(getattr(it, "text", "") or "")
+            title = clean_text(getattr(it, "title", "") or "")
+
+            if not body and not title:
+                continue
 
             ok = is_signal_strict(body) or is_signal_soft(title)
             if not ok:
@@ -81,20 +97,33 @@ def main() -> None:
 
             passed += 1
 
-            # делаем сигнатуру из title/body/tags (правилами)
-            sig = make_signature(title=title, body=body, tags=it.tags)
+            tags = list(getattr(it, "tags", []) or [])
+            sig = make_signature(title=title, body=body, tags=tags)
+
+            # метрики (безопасно, даже если полей нет)
+            view_count = _safe_int(it, "view_count", 0)
+            answer_count = _safe_int(it, "answer_count", 0)
+            is_answered = _safe_bool(it, "is_answered", False)
+
+            # StackExchange может отдавать score как "score" (upvotes-downvotes)
+            vote_score = _safe_int(it, "vote_score", None) if hasattr(it, "vote_score") else _safe_int(it, "score", 0)
+
+            # время активности: часто "last_activity_at" или "last_activity_date"
+            last_activity_at = _safe_int(it, "last_activity_at", None) if hasattr(it, "last_activity_at") else _safe_int(
+                it, "last_activity_date", 0
+            )
 
             if ingest(
                 text=body or title,
-                source=it.source,
-                query=it.query,
-                url=it.url,
-                tags=it.tags,
-                view_count=int(it.view_count or 0),
-                answer_count=int(it.answer_count or 0),
-                is_answered=bool(it.is_answered or False),
-                vote_score=int(it.vote_score or 0),
-                last_activity_at=int(it.last_activity_at or 0),
+                source=str(getattr(it, "source", "stackexchange")),
+                query=getattr(it, "query", None),
+                url=getattr(it, "url", None),
+                tags=tags,
+                view_count=view_count,
+                answer_count=answer_count,
+                is_answered=is_answered,
+                vote_score=vote_score,
+                last_activity_at=last_activity_at,
                 signature=sig,
             ):
                 ingested += 1
