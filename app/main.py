@@ -3,18 +3,16 @@ from __future__ import annotations
 from datetime import datetime
 from typing import List, Optional, Set
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from core.models import Task
 from core.extractor import extract_task
+from core.cluster import cluster_tasks, norm_text
 
 app = FastAPI(title="Hunter Agent")
 
 
-# ----------------------------
-# API Schemas
-# ----------------------------
 class IngestRequest(BaseModel):
     text: str = Field(..., min_length=1)
     source: Optional[str] = "manual"
@@ -23,13 +21,14 @@ class IngestRequest(BaseModel):
 
 
 class ExtractRequest(BaseModel):
-    limit: int = 50  # how many latest raw items to process
-    only_new: bool = True  # skip already-extracted raw ids
+    limit: int = 200
+    only_new: bool = True
 
 
 class StoredRaw(BaseModel):
     id: int
     text: str
+    normalized: str
     source: Optional[str] = None
     query: Optional[str] = None
     url: Optional[str] = None
@@ -43,17 +42,12 @@ class StoredTask(BaseModel):
     created_at: str
 
 
-# ----------------------------
-# In-memory stores (MVP)
-# ----------------------------
 RAW_STORE: List[StoredRaw] = []
 TASK_STORE: List[StoredTask] = []
 EXTRACTED_RAW_IDS: Set[int] = set()
+RAW_DEDUP_SET: Set[str] = set()
 
 
-# ----------------------------
-# Endpoints
-# ----------------------------
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -61,15 +55,25 @@ def health():
 
 @app.post("/ingest")
 def ingest(req: IngestRequest):
+    text = req.text.strip()
+    if text.lower() in {"string", "test", "asdf"}:
+        raise HTTPException(status_code=400, detail="Placeholder text. Put a real problem/query.")
+
+    normalized = norm_text(text)
+    if normalized in RAW_DEDUP_SET:
+        return {"ok": True, "deduped": True, "message": "Already ingested", "text": text}
+
     item = StoredRaw(
         id=len(RAW_STORE) + 1,
-        text=req.text.strip(),
+        text=text,
+        normalized=normalized,
         source=req.source,
         query=req.query,
         url=req.url,
         created_at=datetime.utcnow().isoformat() + "Z",
     )
     RAW_STORE.append(item)
+    RAW_DEDUP_SET.add(normalized)
     return {"ok": True, "item": item.model_dump()}
 
 
@@ -81,7 +85,6 @@ def raw(limit: int = 50):
 
 @app.post("/extract")
 def extract(req: ExtractRequest):
-    # Choose candidates
     candidates = RAW_STORE[-req.limit:] if req.limit > 0 else list(RAW_STORE)
 
     created: List[dict] = []
@@ -119,9 +122,19 @@ def tasks(limit: int = 50):
     return {"count": len(TASK_STORE), "items": [x.model_dump() for x in items]}
 
 
+@app.get("/clusters")
+def clusters(limit: int = 20, min_count: int = 1, sample_size: int = 3):
+    # Build clusters from extracted tasks
+    all_tasks = [st.task for st in TASK_STORE]
+    clusters_list = cluster_tasks(all_tasks, sample_size=sample_size)
+    clusters_list = [c for c in clusters_list if c["count"] >= min_count]
+    return {"count": len(clusters_list), "items": clusters_list[:limit]}
+
+
 @app.post("/reset")
 def reset():
     RAW_STORE.clear()
     TASK_STORE.clear()
     EXTRACTED_RAW_IDS.clear()
+    RAW_DEDUP_SET.clear()
     return {"ok": True}
