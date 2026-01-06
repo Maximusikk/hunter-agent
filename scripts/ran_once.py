@@ -1,6 +1,9 @@
 """
 Demonstration script for the hunter-agent project.
 123213
+
+print("hello world!")
+
 This script performs a manual, one-off execution of the hunter-agent
 pipeline to show how raw text inputs can be transformed into structured
 Task objects and then aggregated into Idea objects. It uses the data
